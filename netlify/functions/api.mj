@@ -1,0 +1,74 @@
+import { getStore } from '@netlify/blobs';
+import crypto from 'node:crypto';
+
+export const config = { path: '/api/*' };
+
+const json = (o, c = 200) => new Response(JSON.stringify(o), {
+  status: c, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } });
+
+let SECRET;
+async function secret(st) {
+  if (SECRET) return SECRET;
+  SECRET = process.env.SECRET || (await st.get('secret'));
+  if (!SECRET) { SECRET = crypto.randomBytes(32).toString('hex'); await st.set('secret', SECRET); }
+  return SECRET;
+}
+const sign = (s, k) => crypto.createHmac('sha256', k).update(s).digest('base64url');
+const mkToken = (phone, k) => { const p = Buffer.from(JSON.stringify({ p: phone, exp: Date.now() + 90 * 864e5 })).toString('base64url'); return p + '.' + sign(p, k); };
+function readToken(t, k) {
+  try {
+    const [p, s] = (t || '').split('.');
+    const a = Buffer.from(sign(p, k)), b = Buffer.from(s || '');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    const o = JSON.parse(Buffer.from(p, 'base64url'));
+    return o.exp > Date.now() ? o.p : null;
+  } catch { return null; }
+}
+const pwHash = (pw, salt) => crypto.scryptSync(pw, salt, 64).toString('hex');
+
+const tries = new Map();
+const limited = ip => { const n = Date.now(), r = (tries.get(ip) || []).filter(t => n - t < 6e5); r.push(n); tries.set(ip, r); return r.length > 10; };
+
+async function handle(req, st) {
+  const route = new URL(req.url).pathname.replace(/^\/api\//, '');
+  const key = await secret(st);
+  let d = {};
+  if (req.method !== 'GET') {
+    const txt = await req.text();
+    if (txt.length > 1.2e6) return json({ error: 'حجم البيانات كبير جدًا.' }, 413);
+    try { d = txt ? JSON.parse(txt) : {}; } catch { return json({ error: 'طلب غير صالح' }, 400); }
+  }
+  if (req.method === 'POST' && (route === 'login' || route === 'register')) {
+    const ip = (req.headers.get('x-nf-client-connection-ip') || req.headers.get('x-forwarded-for') || '').split(',')[0].trim();
+    if (limited(ip)) return json({ error: 'محاولات كثيرة. انتظر عشر دقائق ثم أعد المحاولة.' }, 429);
+    const phone = String(d.p || '').replace(/\D/g, ''), pw = String(d.w || '');
+    if (phone.length < 9 || phone.length > 15) return json({ error: 'أدخل رقم هاتف صحيحًا.' }, 400);
+    if (pw.length < 6) return json({ error: 'كلمة المرور لا تقل عن 6 أحرف.' }, 400);
+    const f = await st.get('f_' + phone, { type: 'json' });
+    if (route === 'register') {
+      const name = String(d.n || '').trim().slice(0, 60);
+      if (!name) return json({ error: 'أدخل اسم ولي الأمر.' }, 400);
+      if (f) return json({ error: 'هذا الرقم مسجّل من قبل. سجّل الدخول.' }, 409);
+      const salt = crypto.randomBytes(16).toString('hex');
+      await st.setJSON('f_' + phone, { name, salt, hash: pwHash(pw, salt), state: {}, v: 0, created: Date.now() });
+      return json({ token: mkToken(phone, key) });
+    }
+    if (!f || !crypto.timingSafeEqual(Buffer.from(pwHash(pw, f.salt)), Buffer.from(f.hash)))
+      return json({ error: 'رقم الهاتف أو كلمة المرور غير صحيحة.' }, 401);
+    return json({ token: mkToken(phone, key) });
+  }
+  const phone = readToken((req.headers.get('authorization') || '').replace('Bearer ', ''), key);
+  const f = phone ? await st.get('f_' + phone, { type: 'json' }) : null;
+  if (!f) return json({ error: 'انتهت الجلسة. سجّل الدخول من جديد.' }, 401);
+  if (route === 'state' && req.method === 'GET') return json({ user: { name: f.name }, v: f.v, d: f.state });
+  if (route === 'state' && req.method === 'PUT') {
+    if (!d.d || typeof d.d !== 'object') return json({ error: 'بيانات غير صالحة.' }, 400);
+    if (JSON.stringify(d.d).length > 9e5) return json({ error: 'حجم البيانات كبير جدًا.' }, 413);
+    if (Number(d.v) !== f.v) return json({ error: 'تم تحديث البيانات من جهاز آخر.' }, 409);
+    await st.setJSON('f_' + phone, { ...f, state: d.d, v: f.v + 1 });
+    return json({ v: f.v + 1 });
+  }
+  return json({ error: 'غير موجود' }, 404);
+}
+
+export default async (req) => handle(req, getStore('baytna'));
